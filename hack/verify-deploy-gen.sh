@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2017 The Kubernetes Authors.
+# Copyright 2018 The Jetstack cert-manager contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ set -o pipefail
 
 SCRIPT_ROOT=$(dirname "${BASH_SOURCE}")/..
 
-DIFFROOT="${SCRIPT_ROOT}/docs"
-TMP_DIFFROOT="${SCRIPT_ROOT}/_tmp/docs"
+DIFFROOT="${SCRIPT_ROOT}/contrib/manifests"
+TMP_DIFFROOT="${SCRIPT_ROOT}/_tmp/contrib/manifests"
 _tmp="${SCRIPT_ROOT}/_tmp"
 
 cleanup() {

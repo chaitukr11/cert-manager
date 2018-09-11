@@ -1,3 +1,11 @@
+// +skip_license_check
+
+/*
+This file contains portions of code directly taken from the 'xenolf/lego' project.
+A copy of the license for this code can be found in the file named LICENSE in
+this directory.
+*/
+
 package util
 
 import (
@@ -36,10 +44,10 @@ var findZoneByFqdnTests = []struct {
 	fqdn string
 	zone string
 }{
-	{"mail.google.com.", "google.com."}, // domain is a CNAME
-	{"foo.google.com.", "google.com."},  // domain is a non-existent subdomain
-	// TODO: work out why this test doesn't work
-	//{"example.com.ac.", "ac."},          // domain is a eTLD
+	{"mail.google.com.", "google.com."},             // domain is a CNAME
+	{"foo.google.com.", "google.com."},              // domain is a non-existent subdomain
+	{"example.com.ac.", "ac."},                      // domain is a eTLD
+	{"cross-zone-example.assets.sh.", "assets.sh."}, // domain is a cross-zone CNAME
 }
 
 var checkAuthoritativeNssTests = []struct {
@@ -55,6 +63,10 @@ var checkAuthoritativeNssTests = []struct {
 	{"ns1.google.com.", "", []string{"ns2.google.com."},
 		false,
 	},
+	// TXT RR /w unexpected value
+	{"8.8.8.8.asn.routeviews.org.", "fe01=", []string{"asnums.routeviews.org."},
+		false,
+	},
 }
 
 var checkAuthoritativeNssTestsErr = []struct {
@@ -62,13 +74,9 @@ var checkAuthoritativeNssTestsErr = []struct {
 	ns          []string
 	error       string
 }{
-	// TXT RR /w unexpected value
-	{"8.8.8.8.asn.routeviews.org.", "fe01=", []string{"asnums.routeviews.org."},
-		"did not return the expected TXT record",
-	},
-	// No TXT RR
-	{"ns1.google.com.", "fe01=", []string{"ns2.google.com."},
-		"did not return the expected TXT record",
+	// invalid nameserver
+	{"8.8.8.8.asn.routeviews.org.", "fe01=", []string{"invalidns.com."},
+		"",
 	},
 }
 
@@ -83,7 +91,7 @@ var checkResolvConfServersTests = []struct {
 
 func TestPreCheckDNS(t *testing.T) {
 	// TODO: find a better TXT record to use in tests
-	ok, err := PreCheckDNS("google.com.", "v=spf1 include:_spf.google.com ~all")
+	ok, err := PreCheckDNS("google.com.", "v=spf1 include:_spf.google.com ~all", []string{"8.8.8.8:53"})
 	if err != nil || !ok {
 		t.Errorf("preCheckDNS failed for acme-staging.api.letsencrypt.org: %s", err.Error())
 	}
@@ -91,7 +99,7 @@ func TestPreCheckDNS(t *testing.T) {
 
 func TestLookupNameserversOK(t *testing.T) {
 	for _, tt := range lookupNameserversTestsOK {
-		nss, err := lookupNameservers(tt.fqdn)
+		nss, err := lookupNameservers(tt.fqdn, RecursiveNameservers)
 		if err != nil {
 			t.Fatalf("#%s: got %q; want nil", tt.fqdn, err)
 		}
@@ -107,7 +115,7 @@ func TestLookupNameserversOK(t *testing.T) {
 
 func TestLookupNameserversErr(t *testing.T) {
 	for _, tt := range lookupNameserversTestsErr {
-		_, err := lookupNameservers(tt.fqdn)
+		_, err := lookupNameservers(tt.fqdn, RecursiveNameservers)
 		if err == nil {
 			t.Fatalf("#%s: expected %q (error); got <nil>", tt.fqdn, tt.error)
 		}

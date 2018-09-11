@@ -1,22 +1,40 @@
+/*
+Copyright 2018 The Jetstack cert-manager contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package acme
 
 import (
 	"context"
 	"fmt"
+	"net"
+	"time"
 
 	"github.com/golang/glog"
-	"golang.org/x/crypto/acme"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/kubernetes"
 	corelisters "k8s.io/client-go/listers/core/v1"
-	"k8s.io/client-go/tools/record"
+	extlisters "k8s.io/client-go/listers/extensions/v1beta1"
 
+	"github.com/jetstack/cert-manager/pkg/acme"
+	"github.com/jetstack/cert-manager/pkg/acme/client"
 	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1alpha1"
-	clientset "github.com/jetstack/cert-manager/pkg/client/clientset/versioned"
+	"github.com/jetstack/cert-manager/pkg/controller"
 	"github.com/jetstack/cert-manager/pkg/issuer"
 	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns"
 	"github.com/jetstack/cert-manager/pkg/issuer/acme/http"
-	"github.com/jetstack/cert-manager/pkg/util/kube"
+	acmeapi "github.com/jetstack/cert-manager/third_party/crypto/acme"
 )
 
 // Acme is an issuer for an ACME server. It can be used to register and obtain
@@ -24,41 +42,35 @@ import (
 // mechanisms.
 type Acme struct {
 	issuer v1alpha1.GenericIssuer
+	*controller.Context
+	helper *acme.Helper
 
-	client   kubernetes.Interface
-	cmClient clientset.Interface
-	recorder record.EventRecorder
-
-	secretsLister corelisters.SecretLister
+	secretsLister  corelisters.SecretLister
+	podsLister     corelisters.PodLister
+	servicesLister corelisters.ServiceLister
+	ingressLister  extlisters.IngressLister
 
 	dnsSolver  solver
 	httpSolver solver
-
-	// issuerResourcesNamespace is a namespace to store resources in. This is
-	// here so we can easily support ClusterIssuers with the same codepath. By
-	// setting this field to either the namespace of the Issuer, or the
-	// clusterResourceNamespace specified on the CLI, we can easily continue
-	// to work with supplemental (e.g. secrets) resources without significant
-	// refactoring.
-	issuerResourcesNamespace string
 }
 
 // solver solves ACME challenges by presenting the given token and key in an
 // appropriate way given the config in the Issuer and Certificate.
 type solver interface {
-	Present(ctx context.Context, crt *v1alpha1.Certificate, domain, token, key string) error
-	Wait(ctx context.Context, crt *v1alpha1.Certificate, domain, token, key string) error
-	CleanUp(ctx context.Context, crt *v1alpha1.Certificate, domain, token, key string) error
+	// we pass the certificate to the Present function so that if the solver
+	// needs to create any new resources, it can set the appropriate owner
+	// reference
+	Present(ctx context.Context, issuer v1alpha1.GenericIssuer, crt *v1alpha1.Certificate, ch v1alpha1.ACMEOrderChallenge) error
+
+	// Check should return Error only if propagation check cannot be performed.
+	// It MUST return `false, nil` if can contact all relevant services and all is
+	// doing is waiting for propagation
+	Check(ch v1alpha1.ACMEOrderChallenge) (bool, error)
+	CleanUp(ctx context.Context, issuer v1alpha1.GenericIssuer, crt *v1alpha1.Certificate, ch v1alpha1.ACMEOrderChallenge) error
 }
 
 // New returns a new ACME issuer interface for the given issuer.
-func New(issuer v1alpha1.GenericIssuer,
-	client kubernetes.Interface,
-	cmClient clientset.Interface,
-	recorder record.EventRecorder,
-	resourceNamespace string,
-	acmeHTTP01SolverImage string,
-	secretsLister corelisters.SecretLister) (issuer.Interface, error) {
+func New(ctx *controller.Context, issuer v1alpha1.GenericIssuer) (issuer.Interface, error) {
 	if issuer.GetSpec().ACME == nil {
 		return nil, fmt.Errorf("acme config may not be empty")
 	}
@@ -69,46 +81,51 @@ func New(issuer v1alpha1.GenericIssuer,
 		return nil, fmt.Errorf("acme server, private key and email are required fields")
 	}
 
-	if resourceNamespace == "" {
-		return nil, fmt.Errorf("resource namespace cannot be empty")
-	}
+	secretsLister := ctx.KubeSharedInformerFactory.Core().V1().Secrets().Lister()
+	podsLister := ctx.KubeSharedInformerFactory.Core().V1().Pods().Lister()
+	servicesLister := ctx.KubeSharedInformerFactory.Core().V1().Services().Lister()
+	ingressLister := ctx.KubeSharedInformerFactory.Extensions().V1beta1().Ingresses().Lister()
 
-	return &Acme{
-		issuer:                   issuer,
-		client:                   client,
-		cmClient:                 cmClient,
-		recorder:                 recorder,
-		secretsLister:            secretsLister,
-		dnsSolver:                dns.NewSolver(issuer, client, secretsLister, resourceNamespace),
-		httpSolver:               http.NewSolver(issuer, client, secretsLister, acmeHTTP01SolverImage),
-		issuerResourcesNamespace: resourceNamespace,
-	}, nil
+	a := &Acme{
+		Context: ctx,
+		helper:  acme.NewHelper(secretsLister, ctx.ClusterResourceNamespace),
+		issuer:  issuer,
+
+		secretsLister:  secretsLister,
+		podsLister:     podsLister,
+		servicesLister: servicesLister,
+		ingressLister:  ingressLister,
+
+		dnsSolver:  dns.NewSolver(ctx),
+		httpSolver: http.NewSolver(ctx),
+	}
+	return a, nil
 }
 
-func (a *Acme) acmeClient() (*acme.Client, error) {
-	secretName, secretKey := a.acmeAccountPrivateKeyMeta()
-	glog.V(4).Infof("getting private key (%s->%s) for acme issuer %s/%s", secretName, secretKey, a.issuerResourcesNamespace, a.issuer.GetObjectMeta().Name)
-	accountPrivKey, err := kube.SecretTLSKeyRef(a.secretsLister, a.issuerResourcesNamespace, secretName, secretKey)
+var timeout = time.Duration(5 * time.Second)
+
+func dialTimeout(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := net.Dialer{Timeout: timeout}
+	return d.DialContext(ctx, network, addr)
+}
+
+// createOrder will create an order for the given certificate with the acme
+// server. Once created, it will set the order URL on the status field of the
+// certificate resource.
+func (a *Acme) createOrder(ctx context.Context, cl client.Interface, crt *v1alpha1.Certificate) (*acmeapi.Order, error) {
+	order, err := buildOrder(crt)
 	if err != nil {
 		return nil, err
 	}
-
-	cl := &acme.Client{
-		Key:          accountPrivKey,
-		DirectoryURL: a.issuer.GetSpec().ACME.Server,
+	order, err = cl.CreateOrder(ctx, order)
+	if err != nil {
+		a.Recorder.Eventf(crt, corev1.EventTypeWarning, "ErrCreateOrder", "Error creating order: %v", err)
+		return nil, err
 	}
-	return cl, nil
-}
 
-// acmeAccountPrivateKeyMeta returns the name and the secret 'key' that stores
-// the ACME account private key.
-func (a *Acme) acmeAccountPrivateKeyMeta() (name string, key string) {
-	secretName := a.issuer.GetSpec().ACME.PrivateKey.Name
-	secretKey := a.issuer.GetSpec().ACME.PrivateKey.Key
-	if len(secretKey) == 0 {
-		secretKey = corev1.TLSPrivateKeyKey
-	}
-	return secretName, secretKey
+	glog.Infof("Created order for domains: %v", order.Identifiers)
+	crt.Status.ACMEStatus().Order.URL = order.URL
+	return order, nil
 }
 
 func (a *Acme) solverFor(challengeType string) (solver, error) {
@@ -118,24 +135,12 @@ func (a *Acme) solverFor(challengeType string) (solver, error) {
 	case "dns-01":
 		return a.dnsSolver, nil
 	}
-	return nil, fmt.Errorf("no solver implemented")
+	return nil, fmt.Errorf("no solver for %q implemented", challengeType)
 }
 
 // Register this Issuer with the issuer factory
 func init() {
-	issuer.Register(issuer.IssuerACME, func(i v1alpha1.GenericIssuer, ctx *issuer.Context) (issuer.Interface, error) {
-		issuerResourcesNamespace := i.GetObjectMeta().Namespace
-		if issuerResourcesNamespace == "" {
-			issuerResourcesNamespace = ctx.ClusterResourceNamespace
-		}
-		return New(
-			i,
-			ctx.Client,
-			ctx.CMClient,
-			ctx.Recorder,
-			issuerResourcesNamespace,
-			ctx.ACMEHTTP01SolverImage,
-			ctx.KubeSharedInformerFactory.Core().V1().Secrets().Lister(),
-		)
+	controller.RegisterIssuer(controller.IssuerACME, func(ctx *controller.Context, i v1alpha1.GenericIssuer) (issuer.Interface, error) {
+		return New(ctx, i)
 	})
 }

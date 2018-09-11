@@ -1,3 +1,19 @@
+/*
+Copyright 2018 The Jetstack cert-manager contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package dns
 
 import (
@@ -7,47 +23,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	kubeinformers "k8s.io/client-go/informers"
-	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1alpha1"
+	"github.com/jetstack/cert-manager/pkg/controller"
+	"github.com/jetstack/cert-manager/pkg/controller/test"
+	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/acmedns"
 	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/cloudflare"
+	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/util"
 )
-
-type fixture struct {
-	// Issuer resource this solver is for
-	Issuer v1alpha1.GenericIssuer
-
-	// Objects here are pre-loaded into the fake client
-	KubeObjects []runtime.Object
-
-	// Secret objects to store in the fake lister
-	SecretLister []*corev1.Secret
-
-	// the resourceNamespace to set on the solver
-	ResourceNamespace string
-
-	// certificate used in the test
-	Certificate *v1alpha1.Certificate
-}
-
-func (f *fixture) solver() *Solver {
-	kubeClient := kubefake.NewSimpleClientset(f.KubeObjects...)
-	sharedInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, 0)
-	secretsLister := sharedInformerFactory.Core().V1().Secrets().Lister()
-	for _, s := range f.SecretLister {
-		sharedInformerFactory.Core().V1().Secrets().Informer().GetIndexer().Add(s)
-	}
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-	sharedInformerFactory.Start(stopCh)
-	return &Solver{
-		issuer:            f.Issuer,
-		client:            kubeClient,
-		secretLister:      secretsLister,
-		resourceNamespace: f.ResourceNamespace,
-	}
-}
 
 func newIssuer(name, namespace string, configs []v1alpha1.ACMEIssuerDNS01Provider) *v1alpha1.Issuer {
 	return &v1alpha1.Issuer{
@@ -67,7 +50,7 @@ func newIssuer(name, namespace string, configs []v1alpha1.ACMEIssuerDNS01Provide
 	}
 }
 
-func newCertificate(name, namespace, cn string, dnsNames []string, configs []v1alpha1.ACMECertificateDomainConfig) *v1alpha1.Certificate {
+func newCertificate(name, namespace, cn string, dnsNames []string, configs []v1alpha1.DomainSolverConfig) *v1alpha1.Certificate {
 	return &v1alpha1.Certificate{
 		Spec: v1alpha1.CertificateSpec{
 			CommonName: cn,
@@ -88,17 +71,23 @@ func newSecret(name, namespace string, data map[string][]byte) *corev1.Secret {
 		Data: data,
 	}
 }
-
 func TestSolverFor(t *testing.T) {
 	type testT struct {
-		f                  *fixture
+		*solverFixture
 		domain             string
 		expectErr          bool
 		expectedSolverType reflect.Type
 	}
 	tests := map[string]testT{
 		"loads secret for cloudflare provider": {
-			f: &fixture{
+			solverFixture: &solverFixture{
+				Builder: &test.Builder{
+					KubeObjects: []runtime.Object{
+						newSecret("cloudflare-key", "default", map[string][]byte{
+							"api-key": []byte("a-cloudflare-api-key"),
+						}),
+					},
+				},
 				Issuer: newIssuer("test", "default", []v1alpha1.ACMEIssuerDNS01Provider{
 					{
 						Name: "fake-cloudflare",
@@ -113,24 +102,19 @@ func TestSolverFor(t *testing.T) {
 						},
 					},
 				}),
-				SecretLister: []*corev1.Secret{newSecret("cloudflare-key", "default", map[string][]byte{
-					"api-key": []byte("a-cloudflare-api-key"),
-				})},
-				ResourceNamespace: "default",
-				Certificate: newCertificate("test", "default", "example.com", nil, []v1alpha1.ACMECertificateDomainConfig{
-					{
-						Domains: []string{"example.com"},
-						DNS01: &v1alpha1.ACMECertificateDNS01Config{
+				Challenge: v1alpha1.ACMEOrderChallenge{
+					SolverConfig: v1alpha1.SolverConfig{
+						DNS01: &v1alpha1.DNS01SolverConfig{
 							Provider: "fake-cloudflare",
 						},
 					},
-				}),
+				},
 			},
 			domain:             "example.com",
 			expectedSolverType: reflect.TypeOf(&cloudflare.DNSProvider{}),
 		},
 		"fails to load a cloudflare provider with a missing secret": {
-			f: &fixture{
+			solverFixture: &solverFixture{
 				Issuer: newIssuer("test", "default", []v1alpha1.ACMEIssuerDNS01Provider{
 					{
 						Name: "fake-cloudflare",
@@ -146,22 +130,26 @@ func TestSolverFor(t *testing.T) {
 					},
 				}),
 				// don't include any secrets in the lister
-				SecretLister:      []*corev1.Secret{},
-				ResourceNamespace: "default",
-				Certificate: newCertificate("test", "default", "example.com", nil, []v1alpha1.ACMECertificateDomainConfig{
-					{
-						Domains: []string{"example.com"},
-						DNS01: &v1alpha1.ACMECertificateDNS01Config{
+				Challenge: v1alpha1.ACMEOrderChallenge{
+					SolverConfig: v1alpha1.SolverConfig{
+						DNS01: &v1alpha1.DNS01SolverConfig{
 							Provider: "fake-cloudflare",
 						},
 					},
-				}),
+				},
 			},
 			domain:    "example.com",
 			expectErr: true,
 		},
 		"fails to load a cloudflare provider with an invalid secret": {
-			f: &fixture{
+			solverFixture: &solverFixture{
+				Builder: &test.Builder{
+					KubeObjects: []runtime.Object{
+						newSecret("cloudflare-key", "default", map[string][]byte{
+							"api-key-oops": []byte("a-cloudflare-api-key"),
+						}),
+					},
+				},
 				Issuer: newIssuer("test", "default", []v1alpha1.ACMEIssuerDNS01Provider{
 					{
 						Name: "fake-cloudflare",
@@ -176,56 +164,26 @@ func TestSolverFor(t *testing.T) {
 						},
 					},
 				}),
-				SecretLister: []*corev1.Secret{newSecret("cloudflare-key", "default", map[string][]byte{
-					"api-key-oops": []byte("a-cloudflare-api-key"),
-				})},
-				ResourceNamespace: "default",
-				Certificate: newCertificate("test", "default", "example.com", nil, []v1alpha1.ACMECertificateDomainConfig{
-					{
-						Domains: []string{"example.com"},
-						DNS01: &v1alpha1.ACMECertificateDNS01Config{
+				Challenge: v1alpha1.ACMEOrderChallenge{
+					SolverConfig: v1alpha1.SolverConfig{
+						DNS01: &v1alpha1.DNS01SolverConfig{
 							Provider: "fake-cloudflare",
 						},
 					},
-				}),
-			},
-			domain:    "example.com",
-			expectErr: true,
-		},
-		"fails to load a provider with no config set for the domain": {
-			f: &fixture{
-				Issuer: newIssuer("test", "default", []v1alpha1.ACMEIssuerDNS01Provider{
-					{
-						Name: "fake-cloudflare",
-						Cloudflare: &v1alpha1.ACMEIssuerDNS01ProviderCloudflare{
-							Email: "test",
-							APIKey: v1alpha1.SecretKeySelector{
-								LocalObjectReference: v1alpha1.LocalObjectReference{
-									Name: "cloudflare-key",
-								},
-								Key: "api-key",
-							},
-						},
-					},
-				}),
-				SecretLister: []*corev1.Secret{newSecret("cloudflare-key", "default", map[string][]byte{
-					"api-key": []byte("a-cloudflare-api-key"),
-				})},
-				ResourceNamespace: "default",
-				Certificate: newCertificate("test", "default", "example.com", nil, []v1alpha1.ACMECertificateDomainConfig{
-					{
-						Domains: []string{"example-oops.com"},
-						DNS01: &v1alpha1.ACMECertificateDNS01Config{
-							Provider: "fake-cloudflare",
-						},
-					},
-				}),
+				},
 			},
 			domain:    "example.com",
 			expectErr: true,
 		},
 		"fails to load a provider with a non-existent provider set for the domain": {
-			f: &fixture{
+			solverFixture: &solverFixture{
+				Builder: &test.Builder{
+					KubeObjects: []runtime.Object{
+						newSecret("cloudflare-key", "default", map[string][]byte{
+							"api-key": []byte("a-cloudflare-api-key"),
+						}),
+					},
+				},
 				Issuer: newIssuer("test", "default", []v1alpha1.ACMEIssuerDNS01Provider{
 					{
 						Name: "fake-cloudflare",
@@ -240,27 +198,58 @@ func TestSolverFor(t *testing.T) {
 						},
 					},
 				}),
-				SecretLister: []*corev1.Secret{newSecret("cloudflare-key", "default", map[string][]byte{
-					"api-key": []byte("a-cloudflare-api-key"),
-				})},
-				ResourceNamespace: "default",
-				Certificate: newCertificate("test", "default", "example.com", nil, []v1alpha1.ACMECertificateDomainConfig{
-					{
-						Domains: []string{"example.com"},
-						DNS01: &v1alpha1.ACMECertificateDNS01Config{
+				Challenge: v1alpha1.ACMEOrderChallenge{
+					SolverConfig: v1alpha1.SolverConfig{
+						DNS01: &v1alpha1.DNS01SolverConfig{
 							Provider: "fake-cloudflare-oops",
 						},
 					},
-				}),
+				},
 			},
 			domain:    "example.com",
 			expectErr: true,
 		},
+		"loads json for acmedns provider": {
+			solverFixture: &solverFixture{
+				Builder: &test.Builder{
+					KubeObjects: []runtime.Object{
+						newSecret("acmedns-key", "default", map[string][]byte{
+							"acmedns.json": []byte("{}"),
+						}),
+					},
+				},
+				Issuer: newIssuer("test", "default", []v1alpha1.ACMEIssuerDNS01Provider{
+					{
+						Name: "fake-acmedns",
+						AcmeDNS: &v1alpha1.ACMEIssuerDNS01ProviderAcmeDNS{
+							Host: "http://127.0.0.1/",
+							AccountSecret: v1alpha1.SecretKeySelector{
+								LocalObjectReference: v1alpha1.LocalObjectReference{
+									Name: "acmedns-key",
+								},
+								Key: "acmedns.json",
+							},
+						},
+					},
+				}),
+				Challenge: v1alpha1.ACMEOrderChallenge{
+					SolverConfig: v1alpha1.SolverConfig{
+						DNS01: &v1alpha1.DNS01SolverConfig{
+							Provider: "fake-acmedns",
+						},
+					},
+				},
+			},
+			domain:             "example.com",
+			expectedSolverType: reflect.TypeOf(&acmedns.DNSProvider{}),
+		},
 	}
 	testFn := func(test testT) func(*testing.T) {
 		return func(t *testing.T) {
-			s := test.f.solver()
-			dnsSolver, err := s.solverFor(test.f.Certificate, test.domain)
+			test.Setup(t)
+			defer test.Finish(t)
+			s := test.Solver
+			dnsSolver, err := s.solverForIssuerProvider(test.Issuer, test.Challenge.SolverConfig.DNS01.Provider)
 			if err != nil && !test.expectErr {
 				t.Errorf("expected solverFor to not error, but got: %s", err.Error())
 				return
@@ -274,5 +263,156 @@ func TestSolverFor(t *testing.T) {
 	}
 	for name, test := range tests {
 		t.Run(name, testFn(test))
+	}
+}
+
+func TestRoute53TrimCreds(t *testing.T) {
+	f := &solverFixture{
+		Builder: &test.Builder{
+			KubeObjects: []runtime.Object{
+				newSecret("route53", "default", map[string][]byte{
+					"secret": []byte("AKIENDINNEWLINE \n"),
+				}),
+			},
+		},
+		Issuer: newIssuer("test", "default", []v1alpha1.ACMEIssuerDNS01Provider{
+			{
+				Name: "fake-route53",
+				Route53: &v1alpha1.ACMEIssuerDNS01ProviderRoute53{
+					AccessKeyID: "  test_with_spaces  ",
+					Region:      "us-west-2",
+					SecretAccessKey: v1alpha1.SecretKeySelector{
+						LocalObjectReference: v1alpha1.LocalObjectReference{
+							Name: "route53",
+						},
+						Key: "secret",
+					},
+				},
+			},
+		}),
+		Challenge: v1alpha1.ACMEOrderChallenge{
+			SolverConfig: v1alpha1.SolverConfig{
+				DNS01: &v1alpha1.DNS01SolverConfig{
+					Provider: "fake-route53",
+				},
+			},
+		},
+		dnsProviders: newFakeDNSProviders(),
+	}
+
+	f.Setup(t)
+	defer f.Finish(t)
+
+	s := f.Solver
+	_, err := s.solverForIssuerProvider(f.Issuer, f.Challenge.SolverConfig.DNS01.Provider)
+	if err != nil {
+		t.Fatalf("expected solverFor to not error, but got: %s", err)
+	}
+
+	expectedR53Call := []fakeDNSProviderCall{
+		{
+			name: "route53",
+			args: []interface{}{"test_with_spaces", "AKIENDINNEWLINE", "", "us-west-2", false, util.RecursiveNameservers},
+		},
+	}
+
+	if !reflect.DeepEqual(expectedR53Call, f.dnsProviders.calls) {
+		t.Fatalf("expected %+v == %+v", expectedR53Call, f.dnsProviders.calls)
+	}
+}
+
+func TestRoute53AmbientCreds(t *testing.T) {
+	type result struct {
+		expectedCall *fakeDNSProviderCall
+		expectedErr  error
+	}
+
+	tests := []struct {
+		in  solverFixture
+		out result
+	}{
+		{
+			solverFixture{
+				Builder: &test.Builder{
+					Context: &controller.Context{
+						IssuerOptions: controller.IssuerOptions{
+							IssuerAmbientCredentials: true,
+						},
+					},
+				},
+				Issuer: newIssuer("test", "default", []v1alpha1.ACMEIssuerDNS01Provider{
+					{
+						Name: "fake-route53",
+						Route53: &v1alpha1.ACMEIssuerDNS01ProviderRoute53{
+							Region: "us-west-2",
+						},
+					},
+				}),
+				dnsProviders: newFakeDNSProviders(),
+				Challenge: v1alpha1.ACMEOrderChallenge{
+					SolverConfig: v1alpha1.SolverConfig{
+						DNS01: &v1alpha1.DNS01SolverConfig{
+							Provider: "fake-route53",
+						},
+					},
+				},
+			},
+			result{
+				expectedCall: &fakeDNSProviderCall{
+					name: "route53",
+					args: []interface{}{"", "", "", "us-west-2", true, util.RecursiveNameservers},
+				},
+			},
+		},
+		{
+			solverFixture{
+				Builder: &test.Builder{
+					Context: &controller.Context{
+						IssuerOptions: controller.IssuerOptions{
+							IssuerAmbientCredentials: false,
+						},
+					},
+				},
+				Issuer: newIssuer("test", "default", []v1alpha1.ACMEIssuerDNS01Provider{
+					{
+						Name: "fake-route53",
+						Route53: &v1alpha1.ACMEIssuerDNS01ProviderRoute53{
+							Region: "us-west-2",
+						},
+					},
+				}),
+				dnsProviders: newFakeDNSProviders(),
+				Challenge: v1alpha1.ACMEOrderChallenge{
+					SolverConfig: v1alpha1.SolverConfig{
+						DNS01: &v1alpha1.DNS01SolverConfig{
+							Provider: "fake-route53",
+						},
+					},
+				},
+			},
+			result{
+				expectedCall: &fakeDNSProviderCall{
+					name: "route53",
+					args: []interface{}{"", "", "", "us-west-2", false, util.RecursiveNameservers},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		f := tt.in
+		f.Setup(t)
+		defer f.Finish(t)
+		s := f.Solver
+		_, err := s.solverForIssuerProvider(f.Issuer, f.Challenge.SolverConfig.DNS01.Provider)
+		if !reflect.DeepEqual(tt.out.expectedErr, err) {
+			t.Fatalf("expected error %v, got error %v", tt.out.expectedErr, err)
+		}
+
+		if tt.out.expectedCall != nil {
+			if !reflect.DeepEqual([]fakeDNSProviderCall{*tt.out.expectedCall}, f.dnsProviders.calls) {
+				t.Fatalf("expected %+v == %+v", []fakeDNSProviderCall{*tt.out.expectedCall}, f.dnsProviders.calls)
+			}
+		}
 	}
 }

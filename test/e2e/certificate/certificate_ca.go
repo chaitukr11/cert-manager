@@ -1,9 +1,12 @@
 /*
-Copyright 2017 Jetstack Ltd.
+Copyright 2018 The Jetstack cert-manager contributors.
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
+
     http://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,6 +17,8 @@ limitations under the License.
 package certificate
 
 import (
+	"time"
+
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
@@ -34,16 +39,9 @@ var _ = framework.CertManagerDescribe("CA Certificate", func() {
 		By("Creating a signing keypair fixture")
 		_, err := f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Create(util.NewSigningKeypairSecret(issuerSecretName))
 		Expect(err).NotTo(HaveOccurred())
-	})
 
-	AfterEach(func() {
-		By("Cleaning up")
-		f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(issuerSecretName, nil)
-	})
-
-	It("should generate a signed keypair", func() {
 		By("Creating an Issuer")
-		_, err := f.CertManagerClientSet.CertmanagerV1alpha1().Issuers(f.Namespace.Name).Create(util.NewCertManagerCAIssuer(issuerName, issuerSecretName))
+		_, err = f.CertManagerClientSet.CertmanagerV1alpha1().Issuers(f.Namespace.Name).Create(util.NewCertManagerCAIssuer(issuerName, issuerSecretName))
 		Expect(err).NotTo(HaveOccurred())
 		By("Waiting for Issuer to become Ready")
 		err = util.WaitForIssuerCondition(f.CertManagerClientSet.CertmanagerV1alpha1().Issuers(f.Namespace.Name),
@@ -53,10 +51,24 @@ var _ = framework.CertManagerDescribe("CA Certificate", func() {
 				Status: v1alpha1.ConditionTrue,
 			})
 		Expect(err).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		By("Cleaning up")
+		f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name).Delete(issuerSecretName, nil)
+		f.CertManagerClientSet.CertmanagerV1alpha1().Issuers(f.Namespace.Name).Delete(issuerName, nil)
+	})
+
+	It("should generate a signed keypair", func() {
+		certClient := f.CertManagerClientSet.CertmanagerV1alpha1().Certificates(f.Namespace.Name)
+		secretClient := f.KubeClientSet.CoreV1().Secrets(f.Namespace.Name)
+
 		By("Creating a Certificate")
-		cert, err := f.CertManagerClientSet.CertmanagerV1alpha1().Certificates(f.Namespace.Name).Create(util.NewCertManagerCACertificate(certificateName, certificateSecretName, issuerName, v1alpha1.IssuerKind))
+		_, err := certClient.Create(util.NewCertManagerBasicCertificate(certificateName, certificateSecretName, issuerName, v1alpha1.IssuerKind))
 		Expect(err).NotTo(HaveOccurred())
-		f.WaitCertificateIssuedValid(cert)
+		By("Verifying the Certificate is valid")
+		err = util.WaitCertificateIssuedValid(certClient, secretClient, certificateName, time.Second*30)
+		Expect(err).NotTo(HaveOccurred())
 	})
 
 })

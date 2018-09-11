@@ -1,5 +1,5 @@
 /*
-Copyright 2018 Jetstack Ltd.
+Copyright 2018 The Jetstack cert-manager contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package scheme
 
 import (
@@ -37,7 +38,7 @@ func init() {
 //
 //   import (
 //     "k8s.io/client-go/kubernetes"
-//     clientsetscheme "k8s.io/client-go/kuberentes/scheme"
+//     clientsetscheme "k8s.io/client-go/kubernetes/scheme"
 //     aggregatorclientsetscheme "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset/scheme"
 //   )
 //
@@ -48,5 +49,4 @@ func init() {
 // correctly.
 func AddToScheme(scheme *runtime.Scheme) {
 	certmanagerv1alpha1.AddToScheme(scheme)
-
 }

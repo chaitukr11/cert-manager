@@ -1,100 +1,193 @@
+/*
+Copyright 2018 The Jetstack cert-manager contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package acme
 
 import (
-	"context"
-	"io/ioutil"
-	"net/http"
-	"strings"
+	"reflect"
 	"testing"
 
-	"golang.org/x/crypto/acme"
-	"gopkg.in/jarcoal/httpmock.v1"
+	"k8s.io/apimachinery/pkg/util/diff"
+
+	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1alpha1"
+	"github.com/jetstack/cert-manager/third_party/crypto/acme"
 )
 
-func TestCheckAuthorization(t *testing.T) {
+const (
+	defaultTestNamespace = "default"
+)
+
+func TestSolverConfigurationForAuthorization(t *testing.T) {
 	type testT struct {
-		name           string
-		mockStatusCode int
-		mockResponse   string
-		ctx            context.Context
-		uri            string
-		expected       bool
-		err            bool
+		cfg         *v1alpha1.ACMECertificateConfig
+		authz       *acme.Authorization
+		expectedCfg *v1alpha1.SolverConfig
+		expectedErr bool
 	}
-	tests := []testT{
-		{
-			name:           "should return no error for 404 return code",
-			mockStatusCode: 404,
-			mockResponse: `{
-  "type": "urn:acme:error:malformed",
-  "detail": "Expired authorization",
-  "status": 404
-}`,
-			uri:      "http://testuri",
-			expected: false,
-			err:      false,
+	tests := map[string]testT{
+		"correctly selects normal domain": testT{
+			cfg: &v1alpha1.ACMECertificateConfig{
+				Config: []v1alpha1.DomainSolverConfig{
+					{
+						Domains: []string{"example.com"},
+						SolverConfig: v1alpha1.SolverConfig{
+							DNS01: &v1alpha1.DNS01SolverConfig{
+								Provider: "correctdns",
+							},
+						},
+					},
+				},
+			},
+			authz: &acme.Authorization{
+				Identifier: acme.AuthzID{
+					Value: "example.com",
+				},
+			},
+			expectedCfg: &v1alpha1.SolverConfig{
+				DNS01: &v1alpha1.DNS01SolverConfig{
+					Provider: "correctdns",
+				},
+			},
 		},
-		{
-			name:           "should return valid for a 200 return code",
-			mockStatusCode: 200,
-			mockResponse: `{
-  "status": "valid"
-}`,
-			uri:      "http://testuri",
-			expected: true,
-			err:      false,
+		"correctly selects normal domain with multiple domains configured": testT{
+			cfg: &v1alpha1.ACMECertificateConfig{
+				Config: []v1alpha1.DomainSolverConfig{
+					{
+						Domains: []string{"notexample.com", "example.com"},
+						SolverConfig: v1alpha1.SolverConfig{
+							DNS01: &v1alpha1.DNS01SolverConfig{
+								Provider: "correctdns",
+							},
+						},
+					},
+				},
+			},
+			authz: &acme.Authorization{
+				Identifier: acme.AuthzID{
+					Value: "example.com",
+				},
+			},
+			expectedCfg: &v1alpha1.SolverConfig{
+				DNS01: &v1alpha1.DNS01SolverConfig{
+					Provider: "correctdns",
+				},
+			},
 		},
-		{
-			name:           "should return invalid but no error for any status that isn't 'valid'",
-			mockStatusCode: 200,
-			mockResponse: `{
-  "status": "invalid"
-}`,
-			uri:      "http://testuri",
-			expected: false,
-			err:      false,
+		"correctly selects normal domain with multiple domains configured separately": testT{
+			cfg: &v1alpha1.ACMECertificateConfig{
+				Config: []v1alpha1.DomainSolverConfig{
+					{
+						Domains: []string{"example.com"},
+						SolverConfig: v1alpha1.SolverConfig{
+							DNS01: &v1alpha1.DNS01SolverConfig{
+								Provider: "correctdns",
+							},
+						},
+					},
+					{
+						Domains: []string{"notexample.com"},
+						SolverConfig: v1alpha1.SolverConfig{
+							DNS01: &v1alpha1.DNS01SolverConfig{
+								Provider: "incorrectdns",
+							},
+						},
+					},
+				},
+			},
+			authz: &acme.Authorization{
+				Identifier: acme.AuthzID{
+					Value: "example.com",
+				},
+			},
+			expectedCfg: &v1alpha1.SolverConfig{
+				DNS01: &v1alpha1.DNS01SolverConfig{
+					Provider: "correctdns",
+				},
+			},
 		},
-		{
-			name:           "should return an error for an invalid response",
-			mockStatusCode: 500,
-			// invalid response body
-			mockResponse: `{
-  "type": "urn:acme:error:malformed",
-  "detail": "Fake error",
-  "status": 500
-}`,
-			uri:      "http://testuri",
-			expected: false,
-			err:      true,
+		"correctly selects configuration for wildcard domain": testT{
+			cfg: &v1alpha1.ACMECertificateConfig{
+				Config: []v1alpha1.DomainSolverConfig{
+					{
+						Domains: []string{"example.com"},
+						SolverConfig: v1alpha1.SolverConfig{
+							DNS01: &v1alpha1.DNS01SolverConfig{
+								Provider: "incorrectdns",
+							},
+						},
+					},
+					{
+						Domains: []string{"*.example.com"},
+						SolverConfig: v1alpha1.SolverConfig{
+							DNS01: &v1alpha1.DNS01SolverConfig{
+								Provider: "correctdns",
+							},
+						},
+					},
+				},
+			},
+			authz: &acme.Authorization{
+				Wildcard: true,
+				Identifier: acme.AuthzID{
+					// identifiers for wildcards do not include the *. prefix and
+					// instead set the Wildcard field on the Authz object
+					Value: "example.com",
+				},
+			},
+			expectedCfg: &v1alpha1.SolverConfig{
+				DNS01: &v1alpha1.DNS01SolverConfig{
+					Provider: "correctdns",
+				},
+			},
+		},
+		"returns an error when configuration for the domain is not found": testT{
+			cfg: &v1alpha1.ACMECertificateConfig{
+				Config: []v1alpha1.DomainSolverConfig{
+					{
+						Domains: []string{"notexample.com"},
+						SolverConfig: v1alpha1.SolverConfig{
+							DNS01: &v1alpha1.DNS01SolverConfig{
+								Provider: "incorrectdns",
+							},
+						},
+					},
+				},
+			},
+			authz: &acme.Authorization{
+				Identifier: acme.AuthzID{
+					Value: "example.com",
+				},
+			},
+			expectedErr: true,
 		},
 	}
-	testFn := func(test testT) func(t *testing.T) {
-		return func(t *testing.T) {
-			mock := httpmock.NewMockTransport()
-			mock.RegisterResponder("GET", test.uri, httpmock.ResponderFromResponse(&http.Response{
-				StatusCode: test.mockStatusCode,
-				Body:       ioutil.NopCloser(strings.NewReader(test.mockResponse)),
-			}))
-			ctx := test.ctx
-			if ctx == nil {
-				ctx = context.Background()
+	for n, test := range tests {
+		t.Run(n, func(t *testing.T) {
+			actualCfg, err := solverConfigurationForAuthorization(test.cfg, test.authz)
+			if err != nil && !test.expectedErr {
+				t.Errorf("Expected to return non-nil error, but got %v", err)
+				return
 			}
-			cl := &acme.Client{
-				HTTPClient: &http.Client{Transport: mock},
+			if err == nil && test.expectedErr {
+				t.Errorf("Expected error, but got none")
+				return
 			}
-			valid, err := checkAuthorization(ctx, cl, test.uri)
-			if err != nil && !test.err {
-				t.Errorf("expected no error, but got: %s", err)
+			if !reflect.DeepEqual(test.expectedCfg, actualCfg) {
+				t.Errorf("Expected did not equal actual: %v", diff.ObjectDiff(test.expectedCfg, actualCfg))
 			}
-			if err == nil && test.err {
-				t.Errorf("expected error, but got no error")
-			}
-			if valid != test.expected {
-				t.Errorf("expected checkAuthorization to return %v, but got %v", test.expected, valid)
-			}
-		}
-	}
-	for _, test := range tests {
-		t.Run(test.name, testFn(test))
+		})
 	}
 }

@@ -1,3 +1,11 @@
+// +skip_license_check
+
+/*
+This file contains portions of code directly taken from the 'xenolf/lego' project.
+A copy of the license for this code can be found in the file named LICENSE in
+this directory.
+*/
+
 // Package cloudflare implements a DNS provider for solving the DNS-01
 // challenge using cloudflare DNS.
 package cloudflare
@@ -5,6 +13,7 @@ package cloudflare
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +21,7 @@ import (
 	"time"
 
 	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/util"
+	pkgutil "github.com/jetstack/cert-manager/pkg/util"
 )
 
 // CloudFlareAPIURL represents the API endpoint to call.
@@ -20,29 +30,31 @@ const CloudFlareAPIURL = "https://api.cloudflare.com/client/v4"
 
 // DNSProvider is an implementation of the acme.ChallengeProvider interface
 type DNSProvider struct {
-	authEmail string
-	authKey   string
+	dns01Nameservers []string
+	authEmail        string
+	authKey          string
 }
 
 // NewDNSProvider returns a DNSProvider instance configured for cloudflare.
 // Credentials must be passed in the environment variables: CLOUDFLARE_EMAIL
 // and CLOUDFLARE_API_KEY.
-func NewDNSProvider() (*DNSProvider, error) {
+func NewDNSProvider(dns01Nameservers []string) (*DNSProvider, error) {
 	email := os.Getenv("CLOUDFLARE_EMAIL")
 	key := os.Getenv("CLOUDFLARE_API_KEY")
-	return NewDNSProviderCredentials(email, key)
+	return NewDNSProviderCredentials(email, key, dns01Nameservers)
 }
 
 // NewDNSProviderCredentials uses the supplied credentials to return a
 // DNSProvider instance configured for cloudflare.
-func NewDNSProviderCredentials(email, key string) (*DNSProvider, error) {
+func NewDNSProviderCredentials(email, key string, dns01Nameservers []string) (*DNSProvider, error) {
 	if email == "" || key == "" {
 		return nil, fmt.Errorf("CloudFlare credentials missing")
 	}
 
 	return &DNSProvider{
-		authEmail: email,
-		authKey:   key,
+		authEmail:        email,
+		authKey:          key,
+		dns01Nameservers: dns01Nameservers,
 	}, nil
 }
 
@@ -54,11 +66,31 @@ func (c *DNSProvider) Timeout() (timeout, interval time.Duration) {
 
 // Present creates a TXT record to fulfil the dns-01 challenge
 func (c *DNSProvider) Present(domain, token, keyAuth string) error {
-	fqdn, value, _ := util.DNS01Record(domain, keyAuth)
+	fqdn, value, _, err := util.DNS01Record(domain, keyAuth, c.dns01Nameservers)
+	if err != nil {
+		return err
+	}
 
 	zoneID, err := c.getHostedZoneID(fqdn)
 	if err != nil {
 		return err
+	}
+
+	record, err := c.findTxtRecord(fqdn)
+	if err != nil && err != errNoExistingRecord {
+		// this is a real error
+		return err
+	}
+	if record != nil {
+		if record.Content == value {
+			// the record is already set to the desired value
+			return nil
+		}
+
+		_, err = c.makeRequest("DELETE", fmt.Sprintf("/zones/%s/dns_records/%s", record.ZoneID, record.ID), nil)
+		if err != nil {
+			return err
+		}
 	}
 
 	rec := cloudFlareRecord{
@@ -83,9 +115,16 @@ func (c *DNSProvider) Present(domain, token, keyAuth string) error {
 
 // CleanUp removes the TXT record matching the specified parameters
 func (c *DNSProvider) CleanUp(domain, token, keyAuth string) error {
-	fqdn, _, _ := util.DNS01Record(domain, keyAuth)
+	fqdn, _, _, err := util.DNS01Record(domain, keyAuth, c.dns01Nameservers)
+	if err != nil {
+		return err
+	}
 
 	record, err := c.findTxtRecord(fqdn)
+	// Nothing to cleanup
+	if err == errNoExistingRecord {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -128,6 +167,8 @@ func (c *DNSProvider) getHostedZoneID(fqdn string) (string, error) {
 	return hostedZone[0].ID, nil
 }
 
+var errNoExistingRecord = errors.New("No existing record found")
+
 func (c *DNSProvider) findTxtRecord(fqdn string) (*cloudFlareRecord, error) {
 	zoneID, err := c.getHostedZoneID(fqdn)
 	if err != nil {
@@ -155,7 +196,7 @@ func (c *DNSProvider) findTxtRecord(fqdn string) (*cloudFlareRecord, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("No existing record found for %s", fqdn)
+	return nil, errNoExistingRecord
 }
 
 func (c *DNSProvider) makeRequest(method, uri string, body io.Reader) (json.RawMessage, error) {
@@ -180,9 +221,11 @@ func (c *DNSProvider) makeRequest(method, uri string, body io.Reader) (json.RawM
 
 	req.Header.Set("X-Auth-Email", c.authEmail)
 	req.Header.Set("X-Auth-Key", c.authKey)
-	//req.Header.Set("User-Agent", userAgent())
+	req.Header.Set("User-Agent", pkgutil.CertManagerUserAgent)
 
-	client := http.Client{Timeout: 30 * time.Second}
+	client := http.Client{
+		Timeout: 30 * time.Second,
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("Error querying Cloudflare API -> %v", err)

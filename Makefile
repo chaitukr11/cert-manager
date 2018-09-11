@@ -1,8 +1,22 @@
+# Copyright 2018 The Jetstack cert-manager contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 PACKAGE_NAME := github.com/jetstack/cert-manager
 REGISTRY := quay.io/jetstack
 APP_NAME := cert-manager
 IMAGE_TAGS := canary
-GOPATH ?= $HOME/go
+GOPATH ?= $$HOME/go
 HACK_DIR ?= hack
 BUILD_TAG := build
 
@@ -10,8 +24,8 @@ BUILD_TAG := build
 # which require a domain that resolves to the ingress controller to be used for
 # e2e tests.
 E2E_NGINX_CERTIFICATE_DOMAIN=
-
-BOULDER_IMAGE_REPO=quay.io/munnerz/boulder
+KUBECONFIG ?= $$HOME/.kube/config
+PEBBLE_IMAGE_REPO=quay.io/munnerz/pebble
 
 # AppVersion is set as the AppVersion to be compiled into the controller binary.
 # It's used as the default version of the 'acmesolver' image to use for ACME
@@ -35,15 +49,33 @@ DOCKER_PUSH_TARGETS := $(addprefix docker_push_, $(CMDS))
 # Go build flags
 GOOS := linux
 GOARCH := amd64
+GIT_COMMIT := $(shell git rev-parse HEAD)
 GOLDFLAGS := -ldflags "-X $(PACKAGE_NAME)/pkg/util.AppGitState=${GIT_STATE} -X $(PACKAGE_NAME)/pkg/util.AppGitCommit=${GIT_COMMIT} -X $(PACKAGE_NAME)/pkg/util.AppVersion=${APP_VERSION}"
 
-.PHONY: verify build docker_build push generate generate_verify $(CMDS) go_test go_fmt $(DOCKER_BUILD_TARGETS) $(DOCKER_PUSH_TARGETS)
+.PHONY: verify build docker_build push generate generate_verify deploy_verify \
+	$(CMDS) go_test go_fmt e2e_test go_verify hack_verify hack_verify_pr \
+	$(DOCKER_BUILD_TARGETS) $(DOCKER_PUSH_TARGETS)
+
+# Docker build flags
+DOCKER_BUILD_FLAGS := --build-arg VCS_REF=$(GIT_COMMIT) $(DOCKER_BUILD_FLAGS)
 
 # Alias targets
 ###############
 
-verify: generate_verify deploy_verify hack_verify go_verify
 build: $(CMDS) docker_build
+verify: verify_lint verify_codegen verify_deps verify_unit
+
+verify_lint: hack_verify go_fmt
+verify_unit: go_test
+verify_deps: dep_verify
+verify_codegen: generate_verify deploy_verify
+# requires docker
+verify_docs:
+	$(HACK_DIR)/verify-reference-docs.sh
+# requires docker
+verify_chart:
+	$(HACK_DIR)/verify-chart-version.sh
+
 docker_build: $(DOCKER_BUILD_TARGETS)
 docker_push: $(DOCKER_PUSH_TARGETS)
 push: build docker_push
@@ -60,10 +92,18 @@ generate_verify:
 # Hack targets
 ##############
 hack_verify:
+	@echo Running boilerplate header checker
+	$(HACK_DIR)/verify_boilerplate.py
 	@echo Running href checker
 	$(HACK_DIR)/verify-links.sh
 	@echo Running errexit checker
 	$(HACK_DIR)/verify-errexit.sh
+
+hack_verify_pr:
+	@echo Running helm chart version checker
+	$(HACK_DIR)/verify-chart-version.sh
+	@echo Running reference docs checker
+	IMAGE=eu.gcr.io/jetstack-build-infra/gen-apidocs-img $(HACK_DIR)/verify-reference-docs.sh
 
 deploy_verify:
 	@echo Running deploy-gen
@@ -71,6 +111,10 @@ deploy_verify:
 
 # Go targets
 #################
+dep_verify:
+	@echo Running dep
+	$(HACK_DIR)/verify-deps.sh
+
 go_verify: go_fmt go_test
 
 $(CMDS):
@@ -87,7 +131,8 @@ go_test:
 			grep -v '/vendor/' | \
 			grep -v '/test/e2e' | \
 			grep -v '/pkg/client' | \
-			grep -v '/third_party' \
+			grep -v '/third_party' | \
+			grep -v '/docs/generated' \
 		)
 
 go_fmt:
@@ -105,18 +150,21 @@ e2e_test:
 	mkdir -p "$$(pwd)/_artifacts"
 	# TODO: make these paths configurable
 	# Run e2e tests
-	KUBECONFIG=$$HOME/.kube/config CERTMANAGERCONFIG=$$HOME/.kube/config \
+	KUBECONFIG=$(KUBECONFIG) CERTMANAGERCONFIG=$(KUBECONFIG) \
 		./e2e-tests \
 			-acme-nginx-certificate-domain=$(E2E_NGINX_CERTIFICATE_DOMAIN) \
-			-boulder-image-repo=$(BOULDER_IMAGE_REPO) \
-			-report-dir=./_artifacts
+			-cloudflare-email=$${CLOUDFLARE_E2E_EMAIL} \
+			-cloudflare-api-key=$${CLOUDFLARE_E2E_API_TOKEN} \
+			-acme-cloudflare-domain=$${CLOUDFLARE_E2E_DOMAIN} \
+			-pebble-image-repo=$(PEBBLE_IMAGE_REPO) \
+			-report-dir="$${ARTIFACTS:-./_artifacts}"
 
 # Docker targets
 ################
 $(DOCKER_BUILD_TARGETS):
 	$(eval DOCKER_BUILD_CMD := $(subst docker_build_,,$@))
 	docker build \
-		--build-arg VCS_REF=$(GIT_COMMIT) \
+		$(DOCKER_BUILD_FLAGS) \
 		-t $(REGISTRY)/$(APP_NAME)-$(DOCKER_BUILD_CMD):$(BUILD_TAG) \
 		-f $(DOCKERFILES)/$(DOCKER_BUILD_CMD)/Dockerfile \
 		$(DOCKERFILES)
